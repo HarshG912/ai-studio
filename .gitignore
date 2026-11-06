@@ -1,0 +1,21 @@
+# Models and Binaries
+models/
+llama.cpp/
+sherpa-onnx-*/
+bin/
+
+# Temporary Build & Output Files
+output/
+*.raw
+*.wav
+*.png
+*.mp4
+*.ass
+*.log
+studio_history.json
+devotional_history.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
