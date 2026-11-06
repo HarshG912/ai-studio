@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, render_template_string, send_from_dir
 
 app = Flask(__name__)
 
-# --- Configuration & Paths ---
+# --- Paths & Directories ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 OUT_DIR = os.path.join(BASE_DIR, "output")
@@ -25,24 +25,23 @@ EXPORT_DIR = os.path.expanduser("~/storage/shared/pipeline")
 LD_STATUS_URL = "http://127.0.0.1:8808/status"
 LD_GENERATE_URL = "http://127.0.0.1:8081/generate"
 
-
 def resolve_bin(name):
     local_p = os.path.join(BASE_DIR, "bin", name)
-    if os.path.exists(local_p): return local_p
+    if os.path.exists(local_p):
+        return local_p
     which = shutil.which(name)
-    if which: return which
+    if which:
+        return which
     return os.path.expanduser(f"~/llama.cpp/build/bin/{name}")
 
 LLAMA_BIN = resolve_bin("llama-cli")
-
 LLM_MODEL = os.path.join(MODELS_DIR, "qwen2.5-3b-instruct-q4_k_m.gguf")
 KOKORO_DIR = os.path.join(MODELS_DIR, "kokoro-en-v0_19")
 
-os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(ASSETS_DIR, exist_ok=True)
-os.makedirs(EXPORT_DIR, exist_ok=True)
-
 def get_sherpa_bin():
+    local_sherpa = os.path.join(BASE_DIR, "bin", "sherpa-onnx-offline-tts")
+    if os.path.exists(local_sherpa):
+        return local_sherpa
     matches = glob.glob(os.path.expanduser("~/sherpa-onnx-*/bin/sherpa-onnx-offline-tts"))
     if matches and os.path.exists(matches[0]):
         return matches[0]
@@ -50,7 +49,11 @@ def get_sherpa_bin():
 
 SHERPA_TTS = get_sherpa_bin()
 
-# --- Job State Tracking ---
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(ASSETS_DIR, exist_ok=True)
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+# --- State ---
 job_state = {
     "running": False,
     "progress": 0,
@@ -67,7 +70,8 @@ def log(msg):
     if len(job_state["logs"]) > 200:
         job_state["logs"].pop(0)
 
-def run_llm(prompt: str) -> str:
+# --- LLM Execution ---
+def run_local_llm(prompt: str) -> str:
     cmd = [
         LLAMA_BIN,
         "-m", LLM_MODEL,
@@ -86,6 +90,24 @@ def run_llm(prompt: str) -> str:
         text=True
     )
     return res.stdout or ""
+
+def run_cloud_llm(prompt: str, api_key: str, base_url: str, model_name: str) -> str:
+    base = base_url.rstrip("/")
+    endpoint = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model_name or "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.5
+    }
+    resp = requests.post(endpoint, json=payload, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 def extract_scenes_json(raw_text: str):
     candidates = []
@@ -114,7 +136,46 @@ def sanitize_scene_text(text: str) -> str:
     ).strip()
     return clean[0].upper() + clean[1:] if clean else ""
 
-def generate_image_via_local_dream(prompt: str, out_path: str, aspect_ratio: str):
+# --- Image Generation ---
+def generate_image_cloud(prompt: str, out_path: str, aspect_ratio: str, api_key: str, base_url: str, model_name: str):
+    base = base_url.rstrip("/")
+    endpoint = f"{base}/images/generations" if base.endswith("/v1") else f"{base}/v1/images/generations"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    size = "1024x1024"
+    if aspect_ratio == "9:16":
+        size = "1024x1792" if "dall-e-3" in model_name.lower() else "1024x1024"
+    elif aspect_ratio == "16:9":
+        size = "1792x1024" if "dall-e-3" in model_name.lower() else "1024x1024"
+
+    payload = {
+        "model": model_name or "dall-e-3",
+        "prompt": f"{prompt}, cinematic lighting, photorealistic, 8k",
+        "n": 1,
+        "size": size,
+        "response_format": "b64_json"
+    }
+
+    resp = requests.post(endpoint, json=payload, headers=headers, timeout=90)
+    resp.raise_for_status()
+    data = resp.json()
+    img_data = data["data"][0]
+
+    if "b64_json" in img_data:
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(img_data["b64_json"]))
+    elif "url" in img_data:
+        r = requests.get(img_data["url"], timeout=60)
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+    else:
+        raise ValueError("Unsupported image response format from Cloud API")
+
+def generate_image_local_dream(prompt: str, out_path: str, aspect_ratio: str):
     status = requests.get(LD_STATUS_URL, timeout=5).json()
     width = status.get("width", 512)
     height = status.get("height", 512)
@@ -132,14 +193,11 @@ def generate_image_via_local_dream(prompt: str, out_path: str, aspect_ratio: str
     img_bytes = None
     meta = {}
     for line in res.iter_lines():
-        if not line:
-            continue
+        if not line: continue
         dec = line.decode("utf-8")
-        if not dec.startswith("data: "):
-            continue
+        if not dec.startswith("data: "): continue
         data_str = dec[6:].strip()
-        if data_str == "[DONE]":
-            break
+        if data_str == "[DONE]": break
         msg = json.loads(data_str)
         if msg.get("type") == "complete":
             img_bytes = base64.b64decode(msg["image"])
@@ -163,6 +221,7 @@ def generate_image_via_local_dream(prompt: str, out_path: str, aspect_ratio: str
         if os.path.exists(raw_path):
             os.remove(raw_path)
 
+# --- Subtitles ---
 def format_ass_time(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
@@ -220,50 +279,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(ass_filepath, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events) + "\n")
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-def save_history(history):
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=2)
-
+# --- Core Pipeline Execution ---
 def execute_pipeline(params):
     job_state["running"] = True
     job_state["progress"] = 5
     job_state["logs"] = []
+
     aspect_ratio = params.get("aspect_ratio", "9:16")
     topic = params.get("topic", "").strip()
     custom_script_raw = params.get("custom_script", "").strip()
     include_subtitles = params.get("subtitles", True)
 
-    try:
-        history = load_history()
-        past_topics = ", ".join(history[-20:]) if history else "None"
+    llm_mode = params.get("llm_mode", "local")
+    llm_key = params.get("llm_key", "").strip()
+    llm_url = params.get("llm_url", "https://api.openai.com/v1").strip()
+    llm_model = params.get("llm_model", "gpt-4o-mini").strip()
 
-        # Step 1: Script & Topic Resolution
+    img_mode = params.get("img_mode", "local")
+    img_key = params.get("img_key", "").strip()
+    img_url = params.get("img_url", "https://api.openai.com/v1").strip()
+    img_model = params.get("img_model", "dall-e-3").strip()
+
+    try:
         if not topic:
-            log("Brainstorming compelling video concept across history, science, space, and mysteries...")
-            topic_prompt = f"""<|im_start|>system
-You are a viral YouTube content researcher finding captivating, curious subjects across science, mysteries, history, astronomy, ancient civilizations, and lost technology.<|im_end|>
-<|im_start|>user
-Pick ONE intriguing documentary subject (e.g., The Voynich Manuscript, Quantum Superposition, Mystery of Oumuamua, The Library of Alexandria, The Antikythera Mechanism, Deep Ocean Bioluminescence).
-Do NOT choose any of these recent topics: [{past_topics}].
-Reply with ONLY the topic title. Do not add quotes, markdown, or punctuation.<|im_end|>
-<|im_start|>assistant
-"""
-            raw_top = run_llm(topic_prompt).strip()
+            log(f"Brainstorming video topic ({'Cloud LLM: ' + llm_model if llm_mode == 'cloud' and llm_key else 'Local Qwen'})...")
+            topic_prompt = "Pick ONE intriguing documentary subject across science, history, space, mysteries, or ancient civilizations. Reply with ONLY the topic title. Do not add quotes or markdown."
+            if llm_mode == "cloud" and llm_key:
+                raw_top = run_cloud_llm(topic_prompt, llm_key, llm_url, llm_model)
+            else:
+                raw_top = run_local_llm(f"<|im_start|>user\n{topic_prompt}<|im_end|>\n<|im_start|>assistant\n")
             topic = [l.strip(' "*-#') for l in raw_top.splitlines() if len(l.strip()) > 3][-1]
         log(f"Active Topic: {topic}")
 
         scenes = []
         if custom_script_raw:
-            log("Parsing custom script feed...")
+            log("Parsing custom script...")
             try:
                 parsed = json.loads(custom_script_raw)
                 if isinstance(parsed, list):
@@ -280,44 +330,33 @@ Reply with ONLY the topic title. Do not add quotes, markdown, or punctuation.<|i
                         "prompt": f"cinematic scene depicting {topic}, highly detailed, dramatic lighting, 8k"
                     })
         else:
-            log("Generating high-hook narration script via Qwen 3B...")
-            script_prompt = f"""<|im_start|>system
-You are an immersive documentary storyteller. Output strict JSON only without explanation or markdown backticks.
-CRITICAL NARRATION RULES:
-1. Hook the viewer immediately from the very first word.
-2. Never say meta-text like "The first scene", "In this scene", "Next", or "In the final scene".
-3. Keep the narration gripping, cinematic, and authoritative.<|im_end|>
-<|im_start|>user
-Write a 35-to-45 second documentary script about: '{topic}'.
+            log(f"Drafting script ({'Cloud LLM: ' + llm_model if llm_mode == 'cloud' and llm_key else 'Local Qwen'})...")
+            script_prompt = f"""Write a 35-to-45 second documentary script about '{topic}'.
 Break it into 4 chronological scenes.
 For each scene provide:
-- "text": Punchy, gripping narration (1 to 2 sentences).
-- "prompt": A descriptive, visually striking image prompt tailored specifically to this scene (e.g. cinematic lighting, detailed atmosphere, 8k).
+- "text": Punchy, gripping narration (1 to 2 sentences). Hook viewer immediately. Never say meta-text like 'Scene 1' or 'The first scene'.
+- "prompt": A descriptive visual prompt for an image generator (8k, photorealistic).
 
 Format strictly as a raw JSON array:
 [
   {{"id": 1, "text": "...", "prompt": "..."}}
-]
-<|im_end|>
-<|im_start|>assistant
-"""
-            raw_script = run_llm(script_prompt)
+]"""
+            if llm_mode == "cloud" and llm_key:
+                raw_script = run_cloud_llm(script_prompt, llm_key, llm_url, llm_model)
+            else:
+                raw_script = run_local_llm(f"<|im_start|>user\n{script_prompt}<|im_end|>\n<|im_start|>assistant\n")
+
             scenes = extract_scenes_json(raw_script)
 
         if not scenes:
-            raise ValueError("Failed to parse or generate valid scene array.")
+            raise ValueError("Failed to extract valid scenes from script output.")
 
-        # Sanitize Narration
         for s in scenes:
             s["text"] = sanitize_scene_text(s["text"])
 
-        history.append(topic)
-        save_history(history)
-
         job_state["progress"] = 25
-        log(f"Script finalized with {len(scenes)} scenes.")
+        log(f"Script ready ({len(scenes)} scenes).")
 
-        # Step 2: Render Audio & Visuals
         clip_paths = []
         clip_durations = []
         voice_durations = []
@@ -351,10 +390,14 @@ Format strictly as a raw JSON array:
             fps = 30
             frames = int((v_dur + 0.5) * fps)
 
-            log(f"[Scene {idx+1}/{len(scenes)}] Rendering visual via Local Dream NPU/GPU...")
-            generate_image_via_local_dream(scene["prompt"], img_path, aspect_ratio)
+            if img_mode == "cloud" and img_key:
+                log(f"[Scene {idx+1}/{len(scenes)}] Generating visual via Cloud ({img_model})...")
+                generate_image_cloud(scene["prompt"], img_path, aspect_ratio, img_key, img_url, img_model)
+            else:
+                log(f"[Scene {idx+1}/{len(scenes)}] Generating visual via Local Dream NPU/GPU...")
+                generate_image_local_dream(scene["prompt"], img_path, aspect_ratio)
 
-            log(f"[Scene {idx+1}/{len(scenes)}] Compiling Ken Burns motion ({aspect_ratio})...")
+            log(f"[Scene {idx+1}/{len(scenes)}] Compiling motion clip ({aspect_ratio})...")
             if aspect_ratio == "9:16":
                 filt = (
                     f"[0:v]crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',scale=2160:3840,"
@@ -424,7 +467,7 @@ Format strictly as a raw JSON array:
         final_filename = f"{safe_topic}_{ratio_tag}.mp4"
         final_output = os.path.join(EXPORT_DIR, final_filename)
 
-        log("Generating captions & mastering final audio...")
+        log("Generating captions & mastering audio...")
         ass_path = os.path.join(OUT_DIR, "web_captions.ass")
         build_ass_subtitles(scenes, voice_durations, ass_path, aspect_ratio)
 
@@ -456,7 +499,7 @@ Format strictly as a raw JSON array:
         job_state["progress"] = 100
         job_state["status"] = "Completed"
         job_state["last_video"] = final_filename
-        log(f"Production successfully exported to: {final_output}")
+        log(f"Video saved to: {final_output}")
 
     except Exception as e:
         log(f"ERROR: {str(e)}")
@@ -464,7 +507,7 @@ Format strictly as a raw JSON array:
     finally:
         job_state["running"] = False
 
-# --- Web UI HTML ---
+# --- Web UI ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -474,12 +517,9 @@ HTML_TEMPLATE = """
     <title>AI Studio</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Plus Jakarta Sans', sans-serif; }
-    </style>
+    <style>body { font-family: 'Plus Jakarta Sans', sans-serif; }</style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen pb-12">
-    <!-- Navbar -->
     <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur-md sticky top-0 z-50 px-6 py-4 flex items-center justify-between">
         <div class="flex items-center space-x-3">
             <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-500 via-indigo-500 to-fuchsia-500 flex items-center justify-center font-bold text-white text-base shadow-lg shadow-indigo-500/20">
@@ -487,7 +527,7 @@ HTML_TEMPLATE = """
             </div>
             <div>
                 <h1 class="text-lg font-extrabold tracking-tight">AI Studio</h1>
-                <p class="text-xs text-indigo-400 font-medium">Autonomous Local Video Production</p>
+                <p class="text-xs text-indigo-400 font-medium">Local & Cloud Accelerated Pipeline</p>
             </div>
         </div>
         <div id="ld-badge" class="px-3 py-1.5 rounded-full text-xs font-semibold bg-slate-800 text-slate-400 border border-slate-700 flex items-center gap-2">
@@ -496,18 +536,17 @@ HTML_TEMPLATE = """
     </header>
 
     <main class="max-w-6xl mx-auto px-4 mt-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
-        <!-- Control Panel -->
         <div class="lg:col-span-7 space-y-6">
             <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-6 shadow-xl">
                 <h2 class="text-base font-semibold text-slate-200 mb-4 flex items-center gap-2">
                     <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg>
-                    Production Controls
+                    Production Setup
                 </h2>
 
                 <div class="space-y-4">
-                    <!-- Aspect Ratio Toggle -->
+                    <!-- Ratio -->
                     <div>
-                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Aspect Ratio & Format</label>
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Aspect Ratio</label>
                         <div class="grid grid-cols-2 gap-3">
                             <label class="relative flex items-center justify-center p-3 rounded-xl border border-slate-800 cursor-pointer bg-slate-950/60 has-[:checked]:border-indigo-500 has-[:checked]:bg-indigo-500/10 transition-all">
                                 <input type="radio" name="ratio" value="9:16" checked class="sr-only">
@@ -526,37 +565,122 @@ HTML_TEMPLATE = """
                         </div>
                     </div>
 
-                    <!-- Topic Input -->
+                    <!-- Topic -->
                     <div>
-                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Topic / Concept</label>
-                        <input id="topic-input" type="text" placeholder="Enter any topic (e.g. Black Holes, Ancient Rome, Deep Sea, Samurai) or leave blank for AI ideation..." 
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Topic</label>
+                        <input id="topic-input" type="text" placeholder="Enter topic or leave blank for AI brainstorming..." 
                             class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-indigo-500 transition-colors">
                     </div>
 
-                    <!-- Custom Script Feed -->
+                    <!-- Custom Script -->
                     <div>
-                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-                            Custom Script (Optional)
-                        </label>
-                        <textarea id="script-input" rows="4" placeholder="Optional: Paste narration paragraphs or raw JSON array. Leave empty to let AI write the script..."
+                        <label class="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Custom Script (Optional)</label>
+                        <textarea id="script-input" rows="3" placeholder="Paste script paragraphs or JSON array. Leave empty for AI script generation..."
                             class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs font-mono focus:outline-none focus:border-indigo-500 transition-colors"></textarea>
                     </div>
 
                     <!-- Subtitles Toggle -->
-                    <div class="flex items-center justify-between pt-2">
+                    <div class="flex items-center justify-between pt-1">
                         <span class="text-sm font-medium text-slate-300">Burn Synchronized Captions</span>
                         <input id="subtitles-toggle" type="checkbox" checked class="w-5 h-5 accent-indigo-500 rounded cursor-pointer">
                     </div>
 
-                    <!-- Launch Button -->
+                    <!-- Acceleration & Model Auto-Detection -->
+                    <div class="border border-slate-800/80 rounded-xl p-4 bg-slate-950/50 space-y-4">
+                        <button type="button" onclick="toggleApiSettings()" class="flex items-center justify-between w-full text-left text-xs font-bold text-indigo-400 uppercase tracking-wider">
+                            <span>⚡ Acceleration & Model Selection</span>
+                            <span id="api-toggle-icon">▼</span>
+                        </button>
+
+                        <div id="api-settings-body" class="space-y-4 hidden pt-2">
+                            <!-- LLM Engine -->
+                            <div class="space-y-2 border-b border-slate-800 pb-4">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-xs font-bold text-slate-300">Script LLM Engine</span>
+                                    <div class="flex gap-2 text-xs">
+                                        <label class="cursor-pointer flex items-center gap-1">
+                                            <input type="radio" name="llm_mode" value="local" checked onchange="toggleLlmFields()"> Local Qwen 3B
+                                        </label>
+                                        <label class="cursor-pointer flex items-center gap-1">
+                                            <input type="radio" name="llm_mode" value="cloud" onchange="toggleLlmFields()"> Cloud API
+                                        </label>
+                                    </div>
+                                </div>
+                                <div id="llm-cloud-inputs" class="space-y-2 hidden pt-1">
+                                    <!-- Preset Provider Selector -->
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-[11px] text-slate-400 font-medium">Provider:</label>
+                                        <select id="llm-provider" onchange="onLlmProviderChange()" class="bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-indigo-300 focus:outline-none">
+                                            <option value="openai">OpenAI</option>
+                                            <option value="groq">Groq</option>
+                                            <option value="openrouter">OpenRouter</option>
+                                            <option value="deepseek">DeepSeek</option>
+                                            <option value="custom">Custom / Self-Hosted</option>
+                                        </select>
+                                    </div>
+                                    <input id="llm-key" type="password" placeholder="API Key (sk-...)" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:border-indigo-500 focus:outline-none">
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        <input id="llm-url" type="text" placeholder="Base URL" value="https://api.openai.com/v1" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:border-indigo-500 focus:outline-none">
+                                        <div class="flex gap-1.5">
+                                            <input id="llm-model" list="llm-model-list" type="text" placeholder="Model (type or select)" value="gpt-4o-mini" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:border-indigo-500 focus:outline-none">
+                                            <datalist id="llm-model-list"></datalist>
+                                            <button type="button" id="btn-fetch-llm" onclick="fetchModels('llm')" class="px-3 bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/40 rounded-lg text-xs font-semibold whitespace-nowrap transition-all">
+                                                Detect
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div id="llm-fetch-status" class="text-[11px] text-slate-500 italic"></div>
+                                </div>
+                            </div>
+
+                            <!-- Image Engine -->
+                            <div class="space-y-2">
+                                <div class="flex items-center justify-between">
+                                    <span class="text-xs font-bold text-slate-300">Image Generation Engine</span>
+                                    <div class="flex gap-2 text-xs">
+                                        <label class="cursor-pointer flex items-center gap-1">
+                                            <input type="radio" name="img_mode" value="local" checked onchange="toggleImgFields()"> Local Dream
+                                        </label>
+                                        <label class="cursor-pointer flex items-center gap-1">
+                                            <input type="radio" name="img_mode" value="cloud" onchange="toggleImgFields()"> Cloud API
+                                        </label>
+                                    </div>
+                                </div>
+                                <div id="img-cloud-inputs" class="space-y-2 hidden pt-1">
+                                    <!-- Preset Provider Selector -->
+                                    <div class="flex items-center gap-2">
+                                        <label class="text-[11px] text-slate-400 font-medium">Provider:</label>
+                                        <select id="img-provider" onchange="onImgProviderChange()" class="bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-indigo-300 focus:outline-none">
+                                            <option value="openai">OpenAI (DALL-E)</option>
+                                            <option value="together">Together AI (Flux / SDXL)</option>
+                                            <option value="custom">Custom / Self-Hosted</option>
+                                        </select>
+                                    </div>
+                                    <input id="img-key" type="password" placeholder="API Key (sk-...)" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:border-indigo-500 focus:outline-none">
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        <input id="img-url" type="text" placeholder="Base URL" value="https://api.openai.com/v1" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:border-indigo-500 focus:outline-none">
+                                        <div class="flex gap-1.5">
+                                            <input id="img-model" list="img-model-list" type="text" placeholder="Model (type or select)" value="dall-e-3" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono focus:border-indigo-500 focus:outline-none">
+                                            <datalist id="img-model-list"></datalist>
+                                            <button type="button" id="btn-fetch-img" onclick="fetchModels('img')" class="px-3 bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 border border-indigo-500/40 rounded-lg text-xs font-semibold whitespace-nowrap transition-all">
+                                                Detect
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div id="img-fetch-status" class="text-[11px] text-slate-500 italic"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <button id="btn-generate" onclick="triggerPipeline()" 
-                        class="w-full mt-4 bg-gradient-to-r from-indigo-500 via-purple-600 to-pink-600 hover:from-indigo-400 hover:to-pink-500 text-white font-bold py-3.5 px-6 rounded-xl shadow-lg shadow-indigo-500/20 active:scale-[0.98] transition-all">
+                        class="w-full mt-2 bg-gradient-to-r from-indigo-500 via-purple-600 to-pink-600 hover:from-indigo-400 hover:to-pink-500 text-white font-bold py-3.5 px-6 rounded-xl shadow-lg shadow-indigo-500/20 active:scale-[0.98] transition-all">
                         Render Video
                     </button>
                 </div>
             </div>
 
-            <!-- Live Logs Terminal -->
+            <!-- Terminal -->
             <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-6 shadow-xl">
                 <div class="flex items-center justify-between mb-3">
                     <h2 class="text-sm font-semibold text-slate-300 flex items-center gap-2">
@@ -573,14 +697,12 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Video Preview & Gallery -->
+        <!-- Preview & Gallery -->
         <div class="lg:col-span-5 space-y-6">
             <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-6 shadow-xl">
                 <h2 class="text-base font-semibold text-slate-200 mb-4">Latest Render</h2>
                 <div id="player-container" class="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden flex items-center justify-center min-h-[360px]">
-                    <div id="player-placeholder" class="text-center p-6 text-slate-500 text-sm">
-                        No video rendered yet this session.
-                    </div>
+                    <div id="player-placeholder" class="text-center p-6 text-slate-500 text-sm">No video rendered yet this session.</div>
                     <video id="video-player" controls class="w-full h-auto hidden max-h-[500px]"></video>
                 </div>
                 <div id="video-actions" class="mt-4 hidden">
@@ -590,7 +712,6 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Pipeline Storage Gallery -->
             <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-6 shadow-xl">
                 <h2 class="text-base font-semibold text-slate-200 mb-3">Gallery (/sdcard/pipeline)</h2>
                 <div id="gallery-list" class="space-y-2 max-h-56 overflow-y-auto pr-1 text-xs">
@@ -602,6 +723,149 @@ HTML_TEMPLATE = """
 
     <script>
         let isPolling = false;
+
+        const LLM_PRESETS = {
+            openai: { url: "https://api.openai.com/v1", defaultModel: "gpt-4o-mini" },
+            groq: { url: "https://api.groq.com/openai/v1", defaultModel: "llama-3.3-70b-versatile" },
+            openrouter: { url: "https://openrouter.ai/api/v1", defaultModel: "deepseek/deepseek-chat" },
+            deepseek: { url: "https://api.deepseek.com", defaultModel: "deepseek-chat" },
+            custom: { url: "", defaultModel: "" }
+        };
+
+        const IMG_PRESETS = {
+            openai: { url: "https://api.openai.com/v1", defaultModel: "dall-e-3" },
+            together: { url: "https://api.together.xyz/v1", defaultModel: "black-forest-labs/FLUX.1-schnell" },
+            custom: { url: "", defaultModel: "" }
+        };
+
+        function onLlmProviderChange() {
+            const val = document.getElementById('llm-provider').value;
+            const preset = LLM_PRESETS[val];
+            if (preset && val !== 'custom') {
+                document.getElementById('llm-url').value = preset.url;
+                document.getElementById('llm-model').value = preset.defaultModel;
+            }
+        }
+
+        function onImgProviderChange() {
+            const val = document.getElementById('img-provider').value;
+            const preset = IMG_PRESETS[val];
+            if (preset && val !== 'custom') {
+                document.getElementById('img-url').value = preset.url;
+                document.getElementById('img-model').value = preset.defaultModel;
+            }
+        }
+
+        async function fetchModels(type) {
+            const isLlm = (type === 'llm');
+            const key = document.getElementById(isLlm ? 'llm-key' : 'img-key').value.trim();
+            const url = document.getElementById(isLlm ? 'llm-url' : 'img-url').value.trim();
+            const statusEl = document.getElementById(isLlm ? 'llm-fetch-status' : 'img-fetch-status');
+            const btn = document.getElementById(isLlm ? 'btn-fetch-llm' : 'btn-fetch-img');
+            const datalist = document.getElementById(isLlm ? 'llm-model-list' : 'img-model-list');
+
+            if (!key) {
+                statusEl.innerText = "Please enter an API key first.";
+                statusEl.className = "text-[11px] text-rose-400";
+                return;
+            }
+
+            statusEl.innerText = "Querying available models...";
+            statusEl.className = "text-[11px] text-indigo-400";
+            btn.disabled = true;
+
+            try {
+                const res = await fetch('/api/fetch_models', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ base_url: url, api_key: key })
+                });
+                const data = await res.json();
+
+                if (data.success && data.models.length > 0) {
+                    datalist.innerHTML = data.models.map(m => `<option value="${m}"></option>`).join('');
+                    statusEl.innerText = `Detected ${data.models.length} models. Click or type in the model box.`;
+                    statusEl.className = "text-[11px] text-emerald-400";
+                    // If current input is empty, select the first detected model
+                    const modelInput = document.getElementById(isLlm ? 'llm-model' : 'img-model');
+                    if (!modelInput.value && data.models.length > 0) {
+                        modelInput.value = data.models[0];
+                    }
+                } else {
+                    statusEl.innerText = `Could not detect models: ${data.error || 'Empty list returned'}`;
+                    statusEl.className = "text-[11px] text-amber-400";
+                }
+            } catch (err) {
+                statusEl.innerText = `Network error: ${err.message}`;
+                statusEl.className = "text-[11px] text-rose-400";
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function toggleApiSettings() {
+            const body = document.getElementById('api-settings-body');
+            const icon = document.getElementById('api-toggle-icon');
+            if (body.classList.contains('hidden')) {
+                body.classList.remove('hidden');
+                icon.innerText = '▲';
+            } else {
+                body.classList.add('hidden');
+                icon.innerText = '▼';
+            }
+        }
+
+        function toggleLlmFields() {
+            const mode = document.querySelector('input[name="llm_mode"]:checked').value;
+            const container = document.getElementById('llm-cloud-inputs');
+            if (mode === 'cloud') container.classList.remove('hidden');
+            else container.classList.add('hidden');
+        }
+
+        function toggleImgFields() {
+            const mode = document.querySelector('input[name="img_mode"]:checked').value;
+            const container = document.getElementById('img-cloud-inputs');
+            if (mode === 'cloud') container.classList.remove('hidden');
+            else container.classList.add('hidden');
+        }
+
+        function saveSettings() {
+            const settings = {
+                llm_mode: document.querySelector('input[name="llm_mode"]:checked').value,
+                llm_provider: document.getElementById('llm-provider').value,
+                llm_key: document.getElementById('llm-key').value,
+                llm_url: document.getElementById('llm-url').value,
+                llm_model: document.getElementById('llm-model').value,
+                img_mode: document.querySelector('input[name="img_mode"]:checked').value,
+                img_provider: document.getElementById('img-provider').value,
+                img_key: document.getElementById('img-key').value,
+                img_url: document.getElementById('img-url').value,
+                img_model: document.getElementById('img-model').value
+            };
+            localStorage.setItem('aistudio_keys', JSON.stringify(settings));
+        }
+
+        function loadSettings() {
+            const saved = localStorage.getItem('aistudio_keys');
+            if (!saved) return;
+            try {
+                const s = JSON.parse(saved);
+                if (s.llm_mode) document.querySelector(`input[name="llm_mode"][value="${s.llm_mode}"]`).checked = true;
+                if (s.llm_provider) document.getElementById('llm-provider').value = s.llm_provider;
+                if (s.llm_key) document.getElementById('llm-key').value = s.llm_key;
+                if (s.llm_url) document.getElementById('llm-url').value = s.llm_url;
+                if (s.llm_model) document.getElementById('llm-model').value = s.llm_model;
+
+                if (s.img_mode) document.querySelector(`input[name="img_mode"][value="${s.img_mode}"]`).checked = true;
+                if (s.img_provider) document.getElementById('img-provider').value = s.img_provider;
+                if (s.img_key) document.getElementById('img-key').value = s.img_key;
+                if (s.img_url) document.getElementById('img-url').value = s.img_url;
+                if (s.img_model) document.getElementById('img-model').value = s.img_model;
+
+                toggleLlmFields();
+                toggleImgFields();
+            } catch (e) {}
+        }
 
         async function checkLocalDream() {
             try {
@@ -619,6 +883,7 @@ HTML_TEMPLATE = """
         }
 
         async function triggerPipeline() {
+            saveSettings();
             const ratio = document.querySelector('input[name="ratio"]:checked').value;
             const topic = document.getElementById('topic-input').value;
             const customScript = document.getElementById('script-input').value;
@@ -632,7 +897,15 @@ HTML_TEMPLATE = """
                 aspect_ratio: ratio,
                 topic: topic,
                 custom_script: customScript,
-                subtitles: subtitles
+                subtitles: subtitles,
+                llm_mode: document.querySelector('input[name="llm_mode"]:checked').value,
+                llm_key: document.getElementById('llm-key').value,
+                llm_url: document.getElementById('llm-url').value,
+                llm_model: document.getElementById('llm-model').value,
+                img_mode: document.querySelector('input[name="img_mode"]:checked').value,
+                img_key: document.getElementById('img-key').value,
+                img_url: document.getElementById('img-url').value,
+                img_model: document.getElementById('img-model').value
             };
 
             await fetch('/api/generate', {
@@ -709,6 +982,7 @@ HTML_TEMPLATE = """
             `).join('');
         }
 
+        loadSettings();
         checkLocalDream();
         loadGallery();
         setInterval(checkLocalDream, 8000);
@@ -717,7 +991,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- Routes ---
+# --- Endpoints ---
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -733,6 +1007,50 @@ def ld_status():
         })
     except Exception:
         return jsonify({"active": False})
+
+@app.route("/api/fetch_models", methods=["POST"])
+def fetch_models_endpoint():
+    """Queries any standard OpenAI-compatible /models endpoint and returns model IDs."""
+    data = request.get_json() or {}
+    base_url = data.get("base_url", "https://api.openai.com/v1").rstrip("/")
+    api_key = data.get("api_key", "").strip()
+
+    if not api_key:
+        return jsonify({"success": False, "error": "API Key is required"}), 400
+
+    endpoint = f"{base_url}/models" if base_url.endswith("/v1") else f"{base_url}/v1/models"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = requests.get(endpoint, headers=headers, timeout=10)
+        # Fallback if provider expects base without /v1
+        if resp.status_code == 404 and not base_url.endswith("/v1"):
+            endpoint = f"{base_url}/models"
+            resp = requests.get(endpoint, headers=headers, timeout=10)
+
+        resp.raise_for_status()
+        res_json = resp.json()
+
+        models = []
+        if "data" in res_json and isinstance(res_json["data"], list):
+            for item in res_json["data"]:
+                if isinstance(item, dict) and "id" in item:
+                    models.append(item["id"])
+        elif isinstance(res_json, list):
+            for item in res_json:
+                if isinstance(item, dict) and "id" in item:
+                    models.append(item["id"])
+                elif isinstance(item, str):
+                    models.append(item)
+
+        models = sorted(list(set(models)))
+        return jsonify({"success": True, "models": models})
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
 
 @app.route("/api/generate", methods=["POST"])
 def generate():
@@ -761,7 +1079,6 @@ def serve_video(filename):
     return send_from_directory(EXPORT_DIR, filename)
 
 if __name__ == "__main__":
-    print("\n[✔] Starting AI Studio Server...")
-    print("    Local Address: http://127.0.0.1:5000")
-    print("    Network Address: http://0.0.0.0:5000\n")
+    print("\n[✔] Starting AI Studio Server with Model Auto-Detection...")
+    print("    Access at: http://localhost:5000\n")
     app.run(host="0.0.0.0", port=5000, debug=False)
