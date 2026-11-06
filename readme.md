@@ -11,7 +11,7 @@ Step 1: Start Local Dream
  * Tap Device link -> Host mode (this device runs models).
 Step 2: Install AI Studio
 Open Termux and run this single setup command:
-git clone https://github.com/YOUR_USERNAME/ai-studio.git
+git clone https://github.com/HarshG912/ai-studio.git
 cd ai-studio
 chmod +x setup.sh start.sh
 ./setup.sh
