@@ -93,7 +93,7 @@ def run_local_llm(prompt: str) -> str:
 
 def run_cloud_llm(prompt: str, api_key: str, base_url: str, model_name: str) -> str:
     base = base_url.rstrip("/")
-    endpoint = f"{base}/chat/completions" if base.endswith("/v1") else f"{base}/v1/chat/completions"
+    endpoint = f"{base}/chat/completions" if (base.endswith("/v1") or "openai" in base.lower()) else f"{base}/v1/chat/completions"
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -611,6 +611,8 @@ HTML_TEMPLATE = """
                                     <div class="flex items-center gap-2">
                                         <label class="text-[11px] text-slate-400 font-medium">Provider:</label>
                                         <select id="llm-provider" onchange="onLlmProviderChange()" class="bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-indigo-300 focus:outline-none">
+                                            <option value="gemini" selected>Google Gemini</option>
+                                            <option value="gemini" selected>Google Gemini</option>
                                             <option value="openai">OpenAI</option>
                                             <option value="groq">Groq</option>
                                             <option value="openrouter">OpenRouter</option>
@@ -725,6 +727,8 @@ HTML_TEMPLATE = """
         let isPolling = false;
 
         const LLM_PRESETS = {
+            gemini: { url: "https://generativelanguage.googleapis.com/v1beta/openai/", defaultModel: "gemini-2.5-flash" },
+            gemini: { url: "https://generativelanguage.googleapis.com/v1beta/openai/", defaultModel: "gemini-2.5-flash" },
             openai: { url: "https://api.openai.com/v1", defaultModel: "gpt-4o-mini" },
             groq: { url: "https://api.groq.com/openai/v1", defaultModel: "llama-3.3-70b-versatile" },
             openrouter: { url: "https://openrouter.ai/api/v1", defaultModel: "deepseek/deepseek-chat" },
@@ -1018,7 +1022,7 @@ def fetch_models_endpoint():
     if not api_key:
         return jsonify({"success": False, "error": "API Key is required"}), 400
 
-    endpoint = f"{base_url}/models" if base_url.endswith("/v1") else f"{base_url}/v1/models"
+    endpoint = f"{base_url}/models" if (base_url.endswith("/v1") or "openai" in base_url.lower()) else f"{base_url}/v1/models"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
